@@ -17,6 +17,7 @@ package org.springframework.data.redis.serializer;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Map;
 import java.util.function.Supplier;
 
 import org.springframework.cache.support.NullValue;
@@ -29,15 +30,12 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JavaType;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping;
-import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
 import com.fasterxml.jackson.databind.jsontype.TypeSerializer;
 import com.fasterxml.jackson.databind.module.SimpleModule;
-import com.fasterxml.jackson.databind.node.TextNode;
 import com.fasterxml.jackson.databind.ser.SerializerFactory;
 import com.fasterxml.jackson.databind.ser.std.StdSerializer;
 import com.fasterxml.jackson.databind.type.TypeFactory;
@@ -55,36 +53,15 @@ import com.fasterxml.jackson.databind.type.TypeFactory;
  */
 public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Object> {
 
-	private ObjectMapper mapper;
+	private final ObjectMapper mapper;
 
 	private final JacksonObjectReader reader;
 
 	private final JacksonObjectWriter writer;
 
-	private boolean internalReader = false;
+	private final Lazy<Boolean> defaultTypingEnabled;
 
 	private final TypeResolver typeResolver;
-
-	private Lazy<Boolean> defaultTypingEnabled = Lazy
-			.of(() -> mapper.getSerializationConfig().getDefaultTyper(null) != null);
-
-	private Lazy<String> typeHintPropertyName;
-
-	{
-		typeHintPropertyName = Lazy.of(() -> {
-			if (defaultTypingEnabled.get()) {
-				return null;
-			}
-
-			return mapper.getDeserializationConfig().getDefaultTyper(null)
-					.buildTypeDeserializer(mapper.getDeserializationConfig(), mapper.getTypeFactory().constructType(Object.class),
-							Collections.emptyList())
-					.getPropertyName();
-
-		}).or("@class");
-
-		typeResolver = new TypeResolver(Lazy.of(() -> mapper.getTypeFactory()), typeHintPropertyName);
-	}
 
 	/**
 	 * Creates {@link GenericJackson2JsonRedisSerializer} and configures {@link ObjectMapper} for default typing.
@@ -104,7 +81,6 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 	 */
 	public GenericJackson2JsonRedisSerializer(@Nullable String classPropertyTypeName) {
 		this(classPropertyTypeName, JacksonObjectReader.create(), JacksonObjectWriter.create());
-		this.internalReader = true;
 	}
 
 	/**
@@ -122,7 +98,7 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 	public GenericJackson2JsonRedisSerializer(@Nullable String classPropertyTypeName, JacksonObjectReader reader,
 			JacksonObjectWriter writer) {
 
-		this(new ObjectMapper(), reader, writer);
+		this(new ObjectMapper(), reader, writer, classPropertyTypeName);
 
 		// simply setting {@code mapper.disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)} does not help here since we need
 		// the type hint embedded for deserialization using the default typing feature.
@@ -133,10 +109,6 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 					classPropertyTypeName);
 		} else {
 			mapper.activateDefaultTyping(mapper.getPolymorphicTypeValidator(), DefaultTyping.EVERYTHING, As.PROPERTY);
-		}
-
-		if (classPropertyTypeName != null) {
-			typeHintPropertyName = Lazy.of(classPropertyTypeName);
 		}
 	}
 
@@ -149,7 +121,6 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 	 */
 	public GenericJackson2JsonRedisSerializer(ObjectMapper mapper) {
 		this(mapper, JacksonObjectReader.create(), JacksonObjectWriter.create());
-		this.internalReader = true;
 	}
 
 	/**
@@ -164,6 +135,11 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 	 */
 	public GenericJackson2JsonRedisSerializer(ObjectMapper mapper, JacksonObjectReader reader,
 			JacksonObjectWriter writer) {
+		this(mapper, reader, writer, null);
+	}
+
+	private GenericJackson2JsonRedisSerializer(ObjectMapper mapper, JacksonObjectReader reader,
+			JacksonObjectWriter writer, @Nullable String typeHintPropertyName) {
 
 		Assert.notNull(mapper, "ObjectMapper must not be null!");
 		Assert.notNull(reader, "Reader must not be null!");
@@ -172,6 +148,29 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 		this.mapper = mapper;
 		this.reader = reader;
 		this.writer = writer;
+
+		this.defaultTypingEnabled = Lazy.of(() -> mapper.getSerializationConfig().getDefaultTyper(null) != null);
+
+		Supplier<String> typeHintPropertyNameSupplier;
+
+		if (typeHintPropertyName == null) {
+
+			typeHintPropertyNameSupplier = Lazy.of(() -> {
+				if (defaultTypingEnabled.get()) {
+					return null;
+				}
+
+				return mapper.getDeserializationConfig().getDefaultTyper(null)
+						.buildTypeDeserializer(mapper.getDeserializationConfig(),
+								mapper.getTypeFactory().constructType(Object.class), Collections.emptyList())
+						.getPropertyName();
+
+			}).or("@class");
+		} else {
+			typeHintPropertyNameSupplier = () -> typeHintPropertyName;
+		}
+
+		this.typeResolver = new TypeResolver(Lazy.of(mapper::getTypeFactory), typeHintPropertyNameSupplier);
 	}
 
 	/**
@@ -233,21 +232,22 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 		}
 	}
 
-	protected JavaType resolveType(byte[] source, Class<?> type) {
+	protected JavaType resolveType(byte[] source, Class<?> type) throws IOException {
 
-		if (internalReader || !type.equals(Object.class) || !defaultTypingEnabled.get()) {
+		if (!type.equals(Object.class) || !defaultTypingEnabled.get()) {
 			return typeResolver.constructType(type);
 		}
 
 		return typeResolver.resolveType(source, type);
 	}
 
-	private static class TypeResolver {
+	static class TypeResolver {
 
-		private final ObjectReader objectReader = new ObjectMapper().reader();
+		// need a separate instance to bypass class hint checks
+		private final ObjectMapper mapper = new ObjectMapper();
 
 		private final Supplier<TypeFactory> typeFactory;
-		private Supplier<String> hintName;
+		private final Supplier<String> hintName;
 
 		public TypeResolver(Supplier<TypeFactory> typeFactory, Supplier<String> hintName) {
 
@@ -259,15 +259,13 @@ public class GenericJackson2JsonRedisSerializer implements RedisSerializer<Objec
 			return typeFactory.get().constructType(type);
 		}
 
-		protected JavaType resolveType(byte[] source, Class<?> type) {
+		protected JavaType resolveType(byte[] source, Class<?> type) throws IOException {
 
-			try {
-				TextNode typeName = (TextNode) objectReader.readValue(source, JsonNode.class).get(hintName.get());
-				if (typeName != null) {
-					return typeFactory.get().constructFromCanonical(typeName.textValue());
-				}
-			} catch (IOException e) {
-				// TODO: logging?
+			Map<?, ?> map = mapper.readValue(source, Map.class);
+			Object typeName = map.get(hintName.get());
+
+			if (typeName != null) {
+				return typeFactory.get().constructFromCanonical(typeName.toString());
 			}
 
 			return constructType(type);
